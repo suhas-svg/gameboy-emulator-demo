@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Game Boy</title>
+<style>
+  :root { --bg: #f4f2ea; --fg: #222; --muted: #666; --line: #bbb; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #1b1c1a; --fg: #eee; --muted: #999; --line: #555; } }
+  body { margin: 0; padding: 16px; background: var(--bg); color: var(--fg); font: 15px/1.5 system-ui, sans-serif;
+         display: flex; flex-direction: column; align-items: center; gap: 12px; }
+  canvas { width: min(100%, 640px); aspect-ratio: 160 / 144; image-rendering: pixelated; background: #e0f8d0; }
+  .bar { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; align-items: center; }
+  button, label.file { font: inherit; padding: 6px 12px; border: 1px solid var(--line); border-radius: 6px;
+         background: transparent; color: inherit; cursor: pointer; }
+  input[type=file] { display: none; }
+  p { margin: 0; color: var(--muted); text-align: center; }
+  a { color: inherit; }
+  #status { min-height: 1.5em; }
+  .pad { display: grid; grid-template-columns: 1fr auto; gap: 16px 24px; width: min(100%, 420px);
+         touch-action: none; user-select: none; -webkit-user-select: none; }
+  .pad button { padding: 0; font-weight: 600; touch-action: none; }
+  .pad button.held { background: var(--line); }
+  .dpad { display: grid; grid-template: repeat(3, 52px) / repeat(3, 52px); }
+  .dpad [data-b="2"] { grid-area: 1 / 2; }
+  .dpad [data-b="1"] { grid-area: 2 / 1; }
+  .dpad [data-b="0"] { grid-area: 2 / 3; }
+  .dpad [data-b="3"] { grid-area: 3 / 2; }
+  .ab { display: flex; gap: 12px; align-items: center; }
+  .ab button { width: 64px; height: 64px; border-radius: 50%; }
+  .menu { grid-column: 1 / -1; display: flex; gap: 12px; justify-content: center; }
+  .menu button { padding: 8px 16px; }
+  /* A mouse and keyboard need no on-screen buttons. */
+  @media (hover: hover) and (pointer: fine) { .pad { display: none; } }
+  @media (hover: none), (pointer: coarse) { .keys { display: none; } }
+</style>
+</head>
+<body>
+<canvas id="screen" width="160" height="144"></canvas>
+<div class="pad" id="pad" aria-label="Game Boy buttons">
+  <div class="dpad">
+    <button data-b="2" aria-label="Up">&uarr;</button>
+    <button data-b="1" aria-label="Left">&larr;</button>
+    <button data-b="0" aria-label="Right">&rarr;</button>
+    <button data-b="3" aria-label="Down">&darr;</button>
+  </div>
+  <div class="ab">
+    <button data-b="5">B</button>
+    <button data-b="4">A</button>
+  </div>
+  <div class="menu">
+    <button data-b="6">Select</button>
+    <button data-b="7">Start</button>
+  </div>
+</div>
+<div class="bar">
+  <button id="demo" hidden>Play demo</button>
+  <label class="file">Load ROM<input id="rom" type="file" accept=".gb"></label>
+  <button id="save-state" disabled>Save state</button>
+  <button id="load-state" disabled>Load state</button>
+  <button id="mute">Mute</button>
+</div>
+<p id="status">Choose a .gb file. It stays in this browser.</p>
+<p class="keys">Arrows move · Z is A · X is B · Enter is Start · Backspace is Select · Hold Tab to fast-forward</p>
+<p id="credit" hidden>Demo game: <a href="https://tangramgames.itch.io/tobutobugirl">Tobu Tobu Girl</a> by Tangram Games, music by potato-tan, unmodified.
+  <a href="demo-LICENSE.txt">Code under MIT</a>, assets under <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>.
+  <a href="https://github.com/SimonLarsen/tobutobugirl">Source</a>.</p>
+<script type="module">
+import init, { Emulator } from "./pkg/gb_web.js";
+
+const ready = init();
+const FRAME_MS = 70224 / 4194304 * 1000;
+const MAX_CATCHUP_FRAMES = 4;
+const FAST_FORWARD_FRAMES = 4;
+const AUDIO_LEAD_S = 0.05;
+const AUDIO_MAX_LEAD_S = 0.25;
+const SAVE_INTERVAL_MS = 3000;
+const KEYS = { ArrowRight: 0, ArrowLeft: 1, ArrowUp: 2, ArrowDown: 3, KeyZ: 4, KeyX: 5, Backspace: 6, Enter: 7 };
+
+const $ = (id) => document.getElementById(id);
+const ctx = $("screen").getContext("2d");
+const image = ctx.createImageData(160, 144);
+let emu = null, title = "", audio = null, audioTime = 0, muted = false, fast = false;
+let last = 0, debt = 0, lastSave = 0;
+
+const toB64 = (bytes) => btoa(Array.from(bytes, (b) => String.fromCharCode(b)).join(""));
+const fromB64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+const store = {
+  get(key) { try { const v = localStorage.getItem(key); return v ? fromB64(v) : null; } catch { return null; } },
+  set(key, bytes) {
+    try { localStorage.setItem(key, toB64(bytes)); return true; }
+    catch { $("status").textContent = "Browser storage is unavailable, so this was not saved."; return false; }
+  },
+};
+const now = () => Date.now() / 1000;
+
+function ensureAudio() {
+  if (!audio) { audio = new AudioContext(); }
+  if (audio.state === "suspended") { audio.resume(); }
+}
+
+function playAudio(samples) {
+  if (!audio || muted || fast || samples.length === 0) return;
+  const t = audio.currentTime;
+  if (audioTime < t) audioTime = t + AUDIO_LEAD_S;
+  if (audioTime > t + AUDIO_MAX_LEAD_S) return;
+  const n = samples.length / 2;
+  const buf = audio.createBuffer(2, n, audio.sampleRate);
+  const left = buf.getChannelData(0), right = buf.getChannelData(1);
+  for (let i = 0; i < n; i++) { left[i] = samples[2 * i]; right[i] = samples[2 * i + 1]; }
+  const src = audio.createBufferSource();
+  src.buffer = buf;
+  src.connect(audio.destination);
+  src.start(audioTime);
+  audioTime += buf.duration;
+}
+
+function persist() {
+  if (!emu) return;
+  const data = emu.save_data(now());
+  if (data && data.length) store.set("sav:" + title, data);
+}
+
+function runOne() {
+  image.data.set(emu.run_frame());
+  playAudio(emu.drain_audio());
+}
+
+function loop(t) {
+  requestAnimationFrame(loop);
+  if (!emu) return;
+  debt += Math.min(t - last, FRAME_MS * MAX_CATCHUP_FRAMES);
+  last = t;
+  let ran = false;
+  if (fast) {
+    for (let i = 0; i < FAST_FORWARD_FRAMES; i++) runOne();
+    debt = 0;
+    ran = true;
+  } else {
+    while (debt >= FRAME_MS) { runOne(); debt -= FRAME_MS; ran = true; }
+  }
+  if (ran) ctx.putImageData(image, 0, 0);
+  if (t - lastSave > SAVE_INTERVAL_MS) {
+    lastSave = t;
+    if (emu.take_save_dirty()) persist();
+  }
+}
+
+async function loadRom(file) {
+  ensureAudio();
+  const rom = new Uint8Array(await file.arrayBuffer());
+  try {
+    await ready;
+    persist();
+    if (emu) emu.free();
+    emu = null;
+    // The save key is needed before the emulator exists, so it comes straight
+    // from the header bytes.
+    title =String.fromCharCode(...rom.slice(0x134, 0x144)).replace(/[^ -~]/g, "").trim() + ":" + rom.length;
+    emu = new Emulator(rom, store.get("sav:" + title), audio.sampleRate, now());
+    $("status").textContent = emu.title() || file.name;
+    $("save-state").disabled = $("load-state").disabled = false;
+    last = performance.now();
+    debt = 0;
+    audioTime = 0;
+  } catch (e) {
+    emu = null;
+    $("status").textContent = "Could not load that file: " + e.message;
+  }
+}
+
+requestAnimationFrame(loop);
+
+// Each on-screen button holds its Game Boy button until that finger lifts.
+for (const button of $("pad").querySelectorAll("button")) {
+  const index = Number(button.dataset.b);
+  const set = (pressed) => {
+    button.classList.toggle("held", pressed);
+    if (emu) emu.set_button(index, pressed);
+  };
+  button.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    ensureAudio();
+    set(true);
+    // Capture keeps the release event coming if the finger slides off the button.
+    try { button.setPointerCapture(e.pointerId); } catch { /* the press still counts */ }
+  });
+  button.addEventListener("pointerup", () => set(false));
+  button.addEventListener("pointercancel", () => set(false));
+  button.addEventListener("contextmenu", (e) => e.preventDefault());
+}
+
+// The demo button appears only if a game is bundled with the page.
+fetch("demo.gb", { method: "HEAD" }).then((r) => { if (r.ok) $("demo").hidden = $("credit").hidden = false; }).catch(() => {});
+$("demo").addEventListener("click", async () => {
+  try {
+    const r = await fetch("demo.gb");
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    await loadRom(new File([await r.arrayBuffer()], "demo.gb"));
+  } catch (e) {
+    $("status").textContent = "Could not load the demo: " + e.message;
+  }
+});
+
+$("rom").addEventListener("change", (e) => { if (e.target.files[0]) loadRom(e.target.files[0]); });
+$("save-state").addEventListener("click", () => {
+  if (store.set("state:" + title, emu.save_state())) $("status").textContent = "State saved.";
+});
+$("load-state").addEventListener("click", () => {
+  const s = store.get("state:" + title);
+  if (!s) { $("status").textContent = "No saved state for this game yet."; return; }
+  try { emu.load_state(s); $("status").textContent = "State loaded."; }
+  catch (e) { $("status").textContent = e.message; }
+});
+$("mute").addEventListener("click", (e) => { muted = !muted; e.target.textContent = muted ? "Unmute" : "Mute"; });
+window.addEventListener("keydown", (e) => {
+  if (e.code === "Tab") { fast = true; e.preventDefault(); return; }
+  if (e.code in KEYS) { e.preventDefault(); if (emu && !e.repeat) emu.set_button(KEYS[e.code], true); }
+});
+window.addEventListener("keyup", (e) => {
+  if (e.code === "Tab") { fast = false; audioTime = 0; e.preventDefault(); return; }
+  if (e.code in KEYS) { e.preventDefault(); if (emu) emu.set_button(KEYS[e.code], false); }
+});
+window.addEventListener("pagehide", persist);
+</script>
+</body>
+</html>
